@@ -1,0 +1,50 @@
+[project]
+name = "vct"
+version = "0.1.0"
+description = "VCT-CompBook backend: data pipeline (vlrggapi -> Postgres) and, later, the web API."
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.14",
+    "httpx>=0.28",
+    "psycopg[binary]>=3.2",
+    "python-dotenv>=1.0",
+    "sqlalchemy>=2.0",   # only used by Alembic to run the raw-SQL migrations
+]
+
+[project.scripts]
+vct-pipeline = "vct.pipeline.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vct"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["migrations.*"]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
