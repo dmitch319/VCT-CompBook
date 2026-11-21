@@ -3,10 +3,20 @@
 Every response, successful or not, is written to raw_responses (and committed straight
 away) before anything parses it, so a parser bug never costs us a refetch.
 
-vlrggapi rate-limits per tier with a 60 s sliding window, and endpoints in one tier share
-its budget: "expensive" (20/min) covers /v2/match/details and /v2/team/...; "moderate"
-(60/min) covers the event endpoints. We space requests per tier to stay under those, and
-on HTTP 429 wait for Retry-After.
+Rate limits. vlrggapi limits each client IP per tier with a 60 s sliding window, and
+every endpoint in a tier shares one budget (cached responses count too):
+  expensive  20/min   /v2/match/..., /v2/stats, /v2/player..., /v2/team...
+  moderate   60/min   /v2/events, /v2/events/matches, /v2/event/..., rankings, news, search
+  cheap     200/min   /v2/health and anything else
+We space requests per tier so we stay under those (one expensive request every 3.2 s is
+at most 19 a minute). If vlrggapi still answers 429 (another client sharing the
+container, or a restart mid-window) we wait for its Retry-After, which it sends in whole
+seconds, plus a second of slack, and retry.
+
+Match details. vlrggapi serves the same handler at /v2/match/details?match_id=N and
+/v2/match/N/details: checked against the container built from the pinned commit, both
+return identical bodies and draw on the same expensive budget. We use the query form,
+which is what raw_responses rows are stored under.
 
 Endpoints with path parameters are written as templates, e.g.
 client.get("/v2/event/{event_id}", event_id=2001). raw_responses stores the template as
@@ -27,16 +37,31 @@ from vct.db import Connection
 
 log = logging.getLogger(__name__)
 
-# vlrggapi's tier per endpoint (api/utils/rate_limiter.py) and our spacing per tier,
-# with a little headroom.
-TIER = {
-    "/v2/match/details": "expensive",
-    "/v2/team/{team_id}/roster": "expensive",
-    "/v2/events/matches": "moderate",
-    "/v2/events": "moderate",
-    "/v2/event/{event_id}": "moderate",
-}
-MIN_INTERVAL = {"expensive": 60 / 20 + 0.2, "moderate": 60 / 60 + 0.1, "cheap": 0.5}
+# vlrggapi's tier table (api/utils/rate_limiter.py at the pinned commit), most specific
+# prefix first. "/v2/match" alone (the ?q= listings) is treated as expensive to be safe.
+TIER_PREFIXES: list[tuple[str, str]] = [
+    ("/v2/match", "expensive"),  # /v2/match/details, /v2/match/{id}/details, /logs, ...
+    ("/v2/stats", "expensive"),
+    ("/v2/player", "expensive"),
+    ("/v2/team", "expensive"),
+    ("/v2/events", "moderate"),  # also /v2/events/matches
+    ("/v2/event/", "moderate"),
+    ("/v2/rankings", "moderate"),
+    ("/v2/news", "moderate"),
+    ("/v2/search", "moderate"),
+]
+TIER_LIMIT_PER_MINUTE = {"expensive": 20, "moderate": 60, "cheap": 200}
+SPACING_SLACK = 0.2  # seconds added to each interval so we never sit exactly at the limit
+RETRY_AFTER_SLACK = 1.0
+MIN_INTERVAL = {tier: 60 / limit + SPACING_SLACK for tier, limit in TIER_LIMIT_PER_MINUTE.items()}
+
+
+def tier_for(endpoint: str) -> str:
+    """vlrggapi's rate-limit tier for an endpoint (template or concrete path)."""
+    for prefix, tier in TIER_PREFIXES:
+        if endpoint == prefix or endpoint.startswith(prefix.rstrip("/") + "/"):
+            return tier
+    return "cheap"
 
 
 def path_fields(endpoint: str) -> set[str]:
@@ -114,7 +139,7 @@ class VlrClient:
     def _throttle(self, endpoint: str) -> None:
         if not self.throttle:
             return
-        tier = TIER.get(endpoint, "cheap")
+        tier = tier_for(endpoint)
         wait = self._last_call.get(tier, 0.0) + MIN_INTERVAL[tier] - time.monotonic()
         if wait > 0:
             time.sleep(wait)
@@ -144,8 +169,10 @@ class VlrClient:
             raw_id, body = store_raw(self.conn, endpoint, stored, resp.status_code, resp.content)
 
             if resp.status_code == 429 and attempt <= self.max_retries:
-                delay = _retry_after(resp, default=60.0)
-                log.warning("%s rate-limited; waiting %.0fs", endpoint, delay)
+                delay = retry_after_seconds(resp, body)
+                log.warning(
+                    "%s rate-limited (%s tier); waiting %.0fs", endpoint, tier_for(endpoint), delay
+                )
                 time.sleep(delay)
                 continue
             if resp.status_code >= 500 and attempt <= self.max_retries:
@@ -166,8 +193,17 @@ class VlrClient:
         return resp.is_success
 
 
-def _retry_after(resp: httpx.Response, default: float) -> float:
-    try:
-        return max(1.0, float(resp.headers.get("Retry-After", default)))
-    except ValueError:
-        return default
+def retry_after_seconds(resp: httpx.Response, body: Any, default: float = 60.0) -> float:
+    """How long to wait after a 429: the Retry-After header (seconds), else the
+    `detail.retry_after` vlrggapi puts in the body, else `default`; plus slack."""
+    candidates: list[Any] = [resp.headers.get("Retry-After")]
+    if isinstance(body, dict) and isinstance(body.get("detail"), dict):
+        candidates.append(body["detail"].get("retry_after"))
+    for value in candidates:
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            continue  # missing, or an HTTP-date, which vlrggapi doesn't send
+        if seconds >= 0:
+            return seconds + RETRY_AFTER_SLACK
+    return default

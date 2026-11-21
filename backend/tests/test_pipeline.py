@@ -363,6 +363,6 @@ def test_429_waits_and_retries(db: Connection, monkeypatch: Any) -> None:
     resp = client.get("/v2/events", q="upcoming")
 
     assert resp.status_code == 200
-    assert sleeps == [7.0]
+    assert sleeps == [7.0 + 1.0]  # Retry-After plus a second of slack
     codes = db.execute("SELECT status_code FROM raw_responses ORDER BY id").fetchall()
     assert [c["status_code"] for c in codes] == [429, 200]  # both stored
