@@ -13,6 +13,7 @@ Response shapes follow vlrggapi at the commit pinned in docker-compose.yml:
 """
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -263,26 +264,36 @@ class MatchParseResult:
     map_ids: list[int] = field(default_factory=list)
 
 
-def _upsert_player(conn: Connection, handle: str) -> int:
-    row = conn.execute(
+def _upsert_player(conn: Connection, player_id: int, handle: str, seen_at: datetime | None) -> None:
+    """players.handle follows the most recent match a player appears in, whatever order
+    matches are parsed in, so a renamed player shows their current handle."""
+    conn.execute(
         """
-        INSERT INTO players (handle) VALUES (%s)
-        ON CONFLICT (handle) DO UPDATE SET updated_at = players.updated_at
-        RETURNING id
+        INSERT INTO players (id, handle, last_seen_at) VALUES (%s, %s, %s)
+        ON CONFLICT (id) DO UPDATE SET
+            handle       = EXCLUDED.handle,
+            last_seen_at = EXCLUDED.last_seen_at,
+            updated_at   = now()
+        WHERE players.last_seen_at IS NULL
+           OR EXCLUDED.last_seen_at >= players.last_seen_at
         """,
-        (handle,),
-    ).fetchone()
-    assert row is not None
-    return int(row["id"])
+        (player_id, handle, seen_at),
+    )
 
 
 def parse_match_detail(
-    conn: Connection, match_id: int, body: Any, raw_id: int | None = None
+    conn: Connection,
+    match_id: int,
+    body: Any,
+    player_ids: Mapping[tuple[int, str], int],
+    raw_id: int | None = None,
 ) -> MatchParseResult:
     """Write one match's teams, maps, per-map team rows, player stats, rounds and veto.
 
     The match must already exist as a stub from parse_event_matches (that is where its
-    event comes from). Run inside a transaction: on error nothing is half-written.
+    event comes from). `player_ids` maps (team_id, handle) to the vlr.gg player ID, from
+    rosters.resolve_match; a player missing from it is an error. Run inside a
+    transaction: on error nothing is half-written.
     """
     segs = segments(body)
     if not segs:
@@ -323,13 +334,14 @@ def parse_match_detail(
     veto_text = (seg.get("map_vetos") or "").strip() or None
     patch = find_patch(seg.get("date"), veto_text)
 
-    updated = conn.execute(
+    match_row = conn.execute(
         """
         UPDATE matches SET
             team1_id = %s, team2_id = %s, team1_score = %s, team2_score = %s,
             winner_team_id = %s, best_of = %s, patch = %s, veto_text = %s,
             detail_raw_id = COALESCE(%s, detail_raw_id), parsed_at = now(), updated_at = now()
         WHERE id = %s
+        RETURNING played_at
         """,
         (
             t1.id,
@@ -343,9 +355,10 @@ def parse_match_detail(
             raw_id,
             match_id,
         ),
-    ).rowcount
-    if updated != 1:
+    ).fetchone()
+    if match_row is None:
         raise ParseError(f"match {match_id}: no stub row; sync its event's match list first")
+    played_at: datetime | None = match_row["played_at"]
 
     # Game (map) IDs only appear in the per-map performance tab list
     by_map = (seg.get("performance") or {}).get("by_map") or []
@@ -446,17 +459,24 @@ def parse_match_detail(
                 handle = (p.get("name") or "").strip()
                 if not handle:
                     continue
+                player_id = player_ids.get((team.id, handle))
+                if player_id is None:
+                    raise ParseError(
+                        f"match {match_id}: no vlr.gg player ID for {handle!r} (team {team.id})"
+                    )
+                _upsert_player(conn, player_id, handle, played_at)
                 conn.execute(
                     """
-                    INSERT INTO map_players (map_id, player_id, team_id, agent, rating, acs,
-                        kills, deaths, assists, kast, adr, hs_pct, first_kills, first_deaths)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO map_players (map_id, player_id, team_id, handle, agent, rating,
+                        acs, kills, deaths, assists, kast, adr, hs_pct, first_kills, first_deaths)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (map_id, player_id) DO NOTHING
                     """,
                     (
                         map_id,
-                        _upsert_player(conn, handle),
+                        player_id,
                         team.id,
+                        handle,
                         (p.get("agent") or "").strip(),
                         to_decimal(p.get("rating")),
                         to_int(p.get("acs")),

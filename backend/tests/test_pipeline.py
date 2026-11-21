@@ -2,6 +2,7 @@
 
 import copy
 import json
+import re
 from collections import Counter
 from datetime import UTC, datetime
 from typing import Any
@@ -19,22 +20,36 @@ from vct.pipeline.sync import sync
 
 
 class FakeVlrggapi:
-    """Serves the fixture bodies and counts requests per endpoint."""
+    """Serves the fixture bodies and counts requests per path. Attributes can be swapped
+    between syncs to simulate vlr.gg changing."""
 
     def __init__(self, detail: dict[str, Any] | None = None) -> None:
         self.calls: Counter[str] = Counter()
-        self.detail = detail or fx.match_detail_body()
+        self.details: dict[str, dict[str, Any]] = {
+            str(fx.MATCH_ID): detail or fx.match_detail_body()
+        }
+        self.event_matches = fx.event_matches_body()
+        self.event_detail = fx.event_detail_body()
+        self.team_rosters = {t: fx.team_roster_body(t) for t in (fx.ALPHA, fx.BRAVO)}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         self.calls[path] += 1
+        body: dict[str, Any] | None = None
         if path == "/v2/events":
-            return httpx.Response(200, json=fx.events_body())
-        if path == "/v2/events/matches":
-            return httpx.Response(200, json=fx.event_matches_body())
-        if path == "/v2/match/details":
-            return httpx.Response(200, json=self.detail)
-        return httpx.Response(404, json={"detail": "not found"})
+            body = fx.events_body()
+        elif path == "/v2/events/matches":
+            body = self.event_matches
+        elif path == "/v2/match/details":
+            body = self.details.get(request.url.params["match_id"])
+        elif path == f"/v2/event/{fx.EVENT_ID}":
+            assert request.url.params.get("include") == "teams"
+            body = self.event_detail
+        elif m := re.fullmatch(r"/v2/team/(\d+)/roster", path):
+            body = self.team_rosters.get(int(m[1]))
+        if body is None:
+            return httpx.Response(404, json={"detail": "not found"})
+        return httpx.Response(200, json=body)
 
 
 def client_for(conn: Connection, api: FakeVlrggapi) -> VlrClient:
@@ -54,7 +69,7 @@ def snapshot(conn: Connection) -> dict[str, Any]:
     tables = {
         "events": "id",
         "teams": "id",
-        "players": "handle",
+        "players": "id",
         "matches": "id",
         "maps": "match_id, map_order",
         "team_maps": "map_id, team_id",
@@ -77,6 +92,28 @@ def test_migrations_roll_back_and_forward(alembic_config: Config, db: Connection
     command.upgrade(alembic_config, "head")
     row = db.execute("SELECT to_regclass('raw_responses') AS t").fetchone()
     assert row is not None and row["t"] is not None
+
+
+def test_0002_upgrade_requeues_matches_parsed_with_name_keyed_players(
+    alembic_config: Config, db: Connection
+) -> None:
+    run_full_sync(db, FakeVlrggapi())
+    command.downgrade(alembic_config, "0001")  # back to name-keyed players (data cleared)
+    db.execute(
+        "UPDATE matches SET parsed_at = now();"
+        " INSERT INTO players (handle) VALUES ('alp_1');"
+        f" INSERT INTO maps (match_id, map_order, map_name, team1_rounds, team2_rounds)"
+        f" VALUES ({fx.MATCH_ID}, 1, 'Ascent', 13, 9)"
+    )
+
+    command.upgrade(alembic_config, "head")
+
+    assert db.execute("SELECT count(*) AS n FROM maps").fetchone() == {"n": 0}
+    assert db.execute("SELECT count(*) AS n FROM players").fetchone() == {"n": 0}
+    match = db.execute("SELECT parsed_at FROM matches WHERE id = %s", (fx.MATCH_ID,)).fetchone()
+    assert match == {"parsed_at": None}  # the next sync refetches it
+    raw = db.execute("SELECT count(*) AS n FROM raw_responses").fetchone()
+    assert raw is not None and raw["n"] > 0  # raw layer kept
 
 
 def test_sync_parses_a_match(db: Connection) -> None:
@@ -122,7 +159,19 @@ def test_sync_parses_a_match(db: Connection) -> None:
     assert all(c["split_total"] == c["rounds_won"] for c in comps)
 
     assert db.execute("SELECT count(*) AS n FROM rounds").fetchone() == {"n": 22 + 24}
-    assert db.execute("SELECT count(*) AS n FROM players").fetchone() == {"n": 10}
+
+    # Players are stored under their vlr.gg IDs: 9 from the event roster, the stand-in
+    # from Bravo's transfer log. Only Bravo's roster history was needed.
+    players = db.execute("SELECT id, handle FROM players ORDER BY id").fetchall()
+    assert {p["handle"]: p["id"] for p in players} == fx.PLAYER_IDS
+    assert api.calls[f"/v2/team/{fx.BRAVO}/roster"] == 1
+    assert api.calls[f"/v2/team/{fx.ALPHA}/roster"] == 0
+    assert api.calls[f"/v2/event/{fx.EVENT_ID}"] == 1
+    per_map = db.execute(
+        "SELECT count(*) AS n FROM map_players WHERE player_id = %s",
+        (fx.PLAYER_IDS[fx.STANDIN],),
+    ).fetchone()
+    assert per_map == {"n": 2}
     veto = db.execute("SELECT action, team_id, map_name FROM veto_steps ORDER BY step_order")
     assert [tuple(v.values()) for v in veto.fetchall()][-2:] == [
         ("ban", fx.BRAVO, "Icebox"),
@@ -158,6 +207,7 @@ def test_second_sync_fetches_nothing_new_and_changes_nothing(db: Connection) -> 
         sync(db, client)
 
     assert api.calls["/v2/match/details"] == 1  # completed matches are fetched once
+    assert api.calls[f"/v2/event/{fx.EVENT_ID}"] == 1  # no new matches, no roster fetch
     assert snapshot(db) == before
 
 
@@ -168,7 +218,7 @@ def test_reparse_rebuilds_everything_without_fetching(db: Connection) -> None:
 
     db.execute(
         "TRUNCATE veto_steps, rounds, map_players, team_maps, maps, matches, players,"
-        " teams, events RESTART IDENTITY CASCADE"
+        " event_rosters, team_roster_players, teams, events RESTART IDENTITY CASCADE"
     )
     calls_before = sum(api.calls.values())
     run = reparse(db)
@@ -176,11 +226,80 @@ def test_reparse_rebuilds_everything_without_fetching(db: Connection) -> None:
     assert run.matches_fetched == 1 and run.matches_failed == 0
     assert sum(api.calls.values()) == calls_before
     after = snapshot(db)
-    # Identity values restart, so compare everything but surrogate keys
-    for table in ("events", "teams", "matches", "veto_steps"):
+    # maps.id restarts, so compare everything keyed on vlr.gg IDs exactly
+    for table in ("events", "teams", "players", "matches", "veto_steps"):
         assert after[table] == before[table], table
-    assert len(after["map_players"]) == len(before["map_players"])
+
+    def without_map_id(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{k: v for k, v in r.items() if k != "map_id"} for r in rows]
+
+    assert without_map_id(after["map_players"]) == without_map_id(before["map_players"])
     assert [m["map_name"] for m in after["maps"]] == [m["map_name"] for m in before["maps"]]
+
+
+def test_unresolved_player_fails_the_match_until_a_roster_has_them(db: Connection) -> None:
+    api = FakeVlrggapi()
+    api.team_rosters[fx.BRAVO] = fx.team_roster_body(fx.BRAVO, include_standin=False)
+    run_full_sync(db, api)
+
+    run = db.execute("SELECT * FROM sync_runs WHERE command = 'sync'").fetchone()
+    assert run is not None and run["status"] == "failed"
+    error = run["details"]["match_errors"][str(fx.MATCH_ID)]
+    assert "UnresolvedPlayers" in error and f"team {fx.BRAVO}: {fx.STANDIN}" in error
+    # Nothing stored for the match; it stays queued
+    assert db.execute("SELECT count(*) AS n FROM maps").fetchone() == {"n": 0}
+    assert db.execute("SELECT count(*) AS n FROM players").fetchone() == {"n": 0}
+    assert db.execute("SELECT parsed_at FROM matches WHERE id = %s", (fx.MATCH_ID,)).fetchone() == {
+        "parsed_at": None
+    }
+
+    # vlr.gg adds the stand-in to the transfer log; the next sync picks the match up
+    api.team_rosters[fx.BRAVO] = fx.team_roster_body(fx.BRAVO)
+    with client_for(db, api) as client:
+        second = sync(db, client)
+    assert (second.matches_fetched, second.matches_failed) == (1, 0)
+    row = db.execute(
+        "SELECT handle FROM players WHERE id = %s", (fx.PLAYER_IDS[fx.STANDIN],)
+    ).fetchone()
+    assert row == {"handle": fx.STANDIN}
+
+
+def test_renamed_player_stays_one_player(db: Connection) -> None:
+    api = FakeVlrggapi()
+    run_full_sync(db, api)
+
+    # alp_1 (ID 101) renames to "alp_one" before their next match
+    renamed = dict(fx.PLAYER_IDS)
+    renamed["alp_one"] = renamed.pop("alp_1")
+    api.event_detail = fx.event_detail_body(renamed)
+    api.event_matches = fx.event_matches_body(extra_completed=((1003, "2026-03-12 18:00:00"),))
+    api.details["1003"] = fx.renamed_detail_body(1003, "alp_1", "alp_one")
+    with client_for(db, api) as client:
+        sync(db, client)
+
+    def check() -> None:
+        players = db.execute("SELECT id, handle FROM players WHERE id = 101").fetchall()
+        assert players == [{"id": 101, "handle": "alp_one"}]  # latest handle
+        history = db.execute(
+            "SELECT DISTINCT match_id, match_handle FROM player_agent_maps"
+            " WHERE player_id = 101 ORDER BY match_id"
+        ).fetchall()
+        assert [(h["match_id"], h["match_handle"]) for h in history] == [
+            (fx.MATCH_ID, "alp_1"),
+            (1003, "alp_one"),
+        ]
+        assert db.execute("SELECT count(*) AS n FROM players").fetchone() == {"n": 10}
+
+    check()
+
+    # A rebuild resolves the old handle too, and the latest handle still wins
+    db.execute(
+        "TRUNCATE map_players, team_maps, maps, matches, players, event_rosters,"
+        " team_roster_players RESTART IDENTITY CASCADE"
+    )
+    run = reparse(db)
+    assert (run.matches_fetched, run.matches_failed) == (2, 0)
+    check()
 
 
 def test_validation_flags_bad_maps_without_failing(db: Connection) -> None:

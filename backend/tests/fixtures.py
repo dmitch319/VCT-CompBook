@@ -44,7 +44,9 @@ def events_body() -> dict[str, Any]:
     )
 
 
-def event_matches_body() -> dict[str, Any]:
+def event_matches_body(extra_completed: tuple[tuple[int, str], ...] = ()) -> dict[str, Any]:
+    """The event's match list; extra_completed adds (match_id, utc time) rows."""
+
     def listed(match_id: int, status: str, ts: str) -> dict[str, Any]:
         return {
             "match_id": str(match_id),
@@ -60,12 +62,12 @@ def event_matches_body() -> dict[str, Any]:
             "team2": {"name": "Team Bravo", "score": "0", "is_winner": False},
         }
 
-    return envelope(
-        [
-            listed(MATCH_ID, "Completed", "2026-03-10 18:00:00"),
-            listed(1002, "Upcoming", ""),
-        ]
-    )
+    rows = [
+        listed(MATCH_ID, "Completed", "2026-03-10 18:00:00"),
+        listed(1002, "Upcoming", ""),
+    ]
+    rows += [listed(mid, "Completed", ts) for mid, ts in extra_completed]
+    return envelope(rows)
 
 
 def _player(name: str, agent: str, rating: str = "1.10") -> dict[str, str]:
@@ -196,3 +198,90 @@ def match_detail_body() -> dict[str, Any]:
             }
         ]
     )
+
+
+# ------------------------------------------------------------------ rosters / player IDs
+
+# vlr.gg player IDs: alp_1..5 -> 101..105, brv_1..5 -> 201..205
+PLAYER_IDS = {f"alp_{i}": 100 + i for i in range(1, 6)} | {f"brv_{i}": 200 + i for i in range(1, 6)}
+STANDIN = "brv_5"  # plays for Bravo but isn't on the event roster
+
+
+def event_detail_body(handles: dict[str, int] | None = None) -> dict[str, Any]:
+    """/v2/event/{id}: data.segments is an object. Bravo's stand-in is missing and an
+    unused sub (brv_6) is listed, as on a real event page."""
+    ids = PLAYER_IDS if handles is None else handles
+
+    def players(prefix: str) -> list[dict[str, str]]:
+        return [
+            {"id": str(pid), "name": h, "flag": "us"}
+            for h, pid in ids.items()
+            if h.startswith(prefix) and h != STANDIN
+        ]
+
+    return {
+        "status": "success",
+        "data": {
+            "status": 200,
+            "segments": {
+                "event": {"name": "Champions Tour 2026: Masters Santiago"},
+                "stages": [],
+                "prizes": [],
+                "teams": [
+                    {"id": str(ALPHA), "name": "Team Alpha", "players": players("alp")},
+                    {
+                        "id": str(BRAVO),
+                        "name": "Team Bravo",
+                        "players": [*players("brv"), {"id": "206", "name": "brv_6", "flag": ""}],
+                    },
+                ],
+                "standings": [],
+            },
+        },
+    }
+
+
+def team_roster_body(team_id: int, include_standin: bool = True) -> dict[str, Any]:
+    """/v2/team/{id}/roster: one segment; the stand-in only appears in the transfer log."""
+    prefix = "alp" if team_id == ALPHA else "brv"
+    active = [
+        {"id": str(pid), "alias": h, "real_name": "", "role": ""}
+        for h, pid in PLAYER_IDS.items()
+        if h.startswith(prefix) and h != STANDIN
+    ]
+    transactions = []
+    if include_standin and team_id == BRAVO:
+        transactions.append(
+            {
+                "date": "2026-03-01",
+                "action": "join",
+                "player": {"name": STANDIN, "id": str(PLAYER_IDS[STANDIN])},
+                "role": "stand-in",
+            }
+        )
+    return envelope(
+        [
+            {
+                "active": active,
+                "staff": [{"id": "999", "alias": "coach", "is_staff": True}],
+                "former": [],
+                "benched": [],
+                "transactions": transactions,
+            }
+        ]
+    )
+
+
+def renamed_detail_body(match_id: int, old: str, new: str) -> dict[str, Any]:
+    """The fixture match again, under another ID, with one player renamed."""
+    body = match_detail_body()
+    seg = body["data"]["segments"][0]
+    seg["match_id"] = str(match_id)
+    for i, game in enumerate(seg["performance"]["by_map"]):
+        game["game_id"] = str(match_id * 10 + i)  # game IDs are unique across matches
+    for mp in seg["maps"]:
+        for side in mp["players"].values():
+            for p in side:
+                if p["name"] == old:
+                    p["name"] = new
+    return body

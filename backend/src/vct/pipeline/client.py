@@ -3,13 +3,19 @@
 Every response, successful or not, is written to raw_responses (and committed straight
 away) before anything parses it, so a parser bug never costs us a refetch.
 
-vlrggapi rate-limits per endpoint tier with a 60 s sliding window: /v2/match/details is
-"expensive" (20/min), /v2/events/matches "moderate" (60/min), the rest "cheap" (200/min).
-We space our own requests to stay under those, and on HTTP 429 wait for Retry-After.
+vlrggapi rate-limits per tier with a 60 s sliding window, and endpoints in one tier share
+its budget: "expensive" (20/min) covers /v2/match/details and /v2/team/...; "moderate"
+(60/min) covers the event endpoints. We space requests per tier to stay under those, and
+on HTTP 429 wait for Retry-After.
+
+Endpoints with path parameters are written as templates, e.g.
+client.get("/v2/event/{event_id}", event_id=2001). raw_responses stores the template as
+`endpoint` and every parameter in `params`, so reparse can find all responses of a kind.
 """
 
 import json
 import logging
+import string
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -21,12 +27,21 @@ from vct.db import Connection
 
 log = logging.getLogger(__name__)
 
-# Minimum seconds between requests to one endpoint, with a little headroom.
-MIN_INTERVAL = {
-    "/v2/match/details": 60 / 20 + 0.2,
-    "/v2/events/matches": 60 / 60 + 0.1,
+# vlrggapi's tier per endpoint (api/utils/rate_limiter.py) and our spacing per tier,
+# with a little headroom.
+TIER = {
+    "/v2/match/details": "expensive",
+    "/v2/team/{team_id}/roster": "expensive",
+    "/v2/events/matches": "moderate",
+    "/v2/events": "moderate",
+    "/v2/event/{event_id}": "moderate",
 }
-DEFAULT_MIN_INTERVAL = 0.5
+MIN_INTERVAL = {"expensive": 60 / 20 + 0.2, "moderate": 60 / 60 + 0.1, "cheap": 0.5}
+
+
+def path_fields(endpoint: str) -> set[str]:
+    """Names of the {placeholders} in an endpoint template."""
+    return {name for _, name, _, _ in string.Formatter().parse(endpoint) if name}
 
 
 class VlrApiError(RuntimeError):
@@ -99,30 +114,34 @@ class VlrClient:
     def _throttle(self, endpoint: str) -> None:
         if not self.throttle:
             return
-        interval = MIN_INTERVAL.get(endpoint, DEFAULT_MIN_INTERVAL)
-        wait = self._last_call.get(endpoint, 0.0) + interval - time.monotonic()
+        tier = TIER.get(endpoint, "cheap")
+        wait = self._last_call.get(tier, 0.0) + MIN_INTERVAL[tier] - time.monotonic()
         if wait > 0:
             time.sleep(wait)
-        self._last_call[endpoint] = time.monotonic()
+        self._last_call[tier] = time.monotonic()
 
     def get(self, endpoint: str, **params: str | int) -> ApiResponse:
         """GET an endpoint, store the response, and return it. Raises VlrApiError on a
         non-2xx response (after retrying 429s and 5xx) or a body that isn't vlrggapi's
         {"status": "success", "data": ...} envelope."""
+        in_path = path_fields(endpoint)
+        url = endpoint.format(**{k: params[k] for k in in_path})
+        query = {k: v for k, v in params.items() if k not in in_path}
+        stored = {k: str(v) for k, v in params.items()}  # stored form: all strings
         attempt = 0
         while True:
             attempt += 1
             self._throttle(endpoint)
             try:
-                resp = self.http.get(endpoint, params=params)
+                resp = self.http.get(url, params=query)
             except httpx.TransportError as exc:
                 if attempt > self.max_retries:
                     raise
-                log.warning("%s %s failed (%s); retrying", endpoint, params, exc)
+                log.warning("%s %s failed (%s); retrying", endpoint, stored, exc)
                 time.sleep(min(2**attempt, 30))
                 continue
 
-            raw_id, body = store_raw(self.conn, endpoint, params, resp.status_code, resp.content)
+            raw_id, body = store_raw(self.conn, endpoint, stored, resp.status_code, resp.content)
 
             if resp.status_code == 429 and attempt <= self.max_retries:
                 delay = _retry_after(resp, default=60.0)
