@@ -44,7 +44,7 @@ def reparse(conn: Connection) -> Run:
             with conn.transaction():
                 # The event may only be known from a hand-tracked placeholder
                 conn.execute(
-                    "INSERT INTO events (id, name) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    "INSERT INTO events (id, name) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING",
                     (event_id, f"event {event_id}"),
                 )
                 parse_event_matches(conn, event_id, row["body"])
