@@ -153,7 +153,7 @@ def match_detail_body() -> dict[str, Any]:
                     "series": "Playoffs: Upper Final",
                     "logo": "",
                 },
-                "date": "Tuesday, March 10th 6:00 PM PDT Patch 12.04",
+                "date": "March 10, 2026 1:00 PM EST Patch 12.04",  # 18:00 UTC
                 "map_vetos": (
                     "ALP ban Bind; BRV ban Haven; ALP pick Ascent; BRV pick Lotus; "
                     "ALP ban Split; BRV ban Icebox; Sunset remains"
@@ -277,6 +277,7 @@ def renamed_detail_body(match_id: int, old: str, new: str) -> dict[str, Any]:
     body = match_detail_body()
     seg = body["data"]["segments"][0]
     seg["match_id"] = str(match_id)
+    seg["date"] = "March 12, 2026 1:00 PM EST Patch 12.04"  # two days after the original
     for i, game in enumerate(seg["performance"]["by_map"]):
         game["game_id"] = str(match_id * 10 + i)  # game IDs are unique across matches
     for mp in seg["maps"]:

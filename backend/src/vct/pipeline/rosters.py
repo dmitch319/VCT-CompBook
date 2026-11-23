@@ -3,12 +3,16 @@
 vlrggapi's match detail names each player but doesn't give their vlr.gg ID. Rosters do,
 so a player in a match is looked up by (team, handle), case-insensitively, in order:
 
+  0. hand-maintained overrides                       (player_overrides,
+                                                      seed/player_overrides.csv)
   1. the team's roster for the match's event        (event_rosters, /v2/event/{id})
   2. the team's roster and transfer history          (team_roster_players,
                                                       /v2/team/{id}/roster)
   3. the same team's earlier matches                 (map_players)
 
-A handle that matches no ID, or two different IDs, is unresolved, and the match is not
+Within a source, two IDs for one handle are settled by an exact-case match ('Player'
+and 'player' can be different people on the same team). A handle that matches no ID,
+or stays ambiguous, is unresolved, and the match is not
 stored until it resolves (see sync.py). Roster rows only accumulate, one per
 (player, handle) seen, never deleted or overwritten: a stand-in who has since left a
 roster, or a match stored under a player's old handle, still resolves.
@@ -130,34 +134,49 @@ def detail_players(body: Any) -> dict[int, set[str]]:
 
 _LOOKUPS = [
     """
-    SELECT DISTINCT player_id FROM event_rosters
-    WHERE event_id = %(event_id)s AND team_id = %(team_id)s AND lower(handle) = lower(%(h)s)
-    """,
-    """
-    SELECT DISTINCT player_id FROM team_roster_players
+    SELECT player_id, handle FROM player_overrides
     WHERE team_id = %(team_id)s AND lower(handle) = lower(%(h)s)
     """,
     """
-    SELECT DISTINCT player_id FROM map_players
+    SELECT player_id, handle FROM event_rosters
+    WHERE event_id = %(event_id)s AND team_id = %(team_id)s AND lower(handle) = lower(%(h)s)
+    """,
+    """
+    SELECT player_id, handle FROM team_roster_players
+    WHERE team_id = %(team_id)s AND lower(handle) = lower(%(h)s)
+    """,
+    """
+    SELECT DISTINCT player_id, handle FROM map_players
     WHERE team_id = %(team_id)s AND lower(handle) = lower(%(h)s)
     """,
 ]
 
 
+def _pick(rows: list[dict[str, Any]], handle: str) -> int | None:
+    """The one player ID these rows point to. If the case-insensitive match is
+    ambiguous ('Player' and 'player' are two people on one team), an exact-case match
+    decides; otherwise None."""
+    ids = {int(r["player_id"]) for r in rows}
+    if len(ids) > 1:
+        ids = {int(r["player_id"]) for r in rows if r["handle"] == handle}
+    return ids.pop() if len(ids) == 1 else None
+
+
 def resolve_handles(
     conn: Connection, event_id: int, team_id: int, handles: set[str]
 ) -> tuple[dict[str, int], set[str]]:
-    """Look handles up in the stored rosters. Returns ({handle: player_id}, unresolved).
-    Each source is tried in turn; an ambiguous match (two IDs) in one source falls
-    through to the next."""
+    """Look handles up in the overrides and stored rosters. Returns
+    ({handle: player_id}, unresolved). Each source is tried in turn; a source that
+    can't pick one ID falls through to the next."""
     resolved: dict[str, int] = {}
     for handle in handles:
         for sql in _LOOKUPS:
             rows = conn.execute(
                 sql, {"event_id": event_id, "team_id": team_id, "h": handle}
             ).fetchall()
-            if len(rows) == 1:
-                resolved[handle] = int(rows[0]["player_id"])
+            player_id = _pick(rows, handle)
+            if player_id is not None:
+                resolved[handle] = player_id
                 break
     return resolved, handles - resolved.keys()
 

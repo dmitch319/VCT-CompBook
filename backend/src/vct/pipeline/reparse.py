@@ -53,6 +53,30 @@ def _ensure_event(conn: Connection, event_id: int) -> None:
     )
 
 
+def refresh_players(conn: Connection) -> int:
+    """Recompute each player's current handle and last_seen_at from their stored matches
+    (latest played_at wins, then highest match ID).
+
+    The per-match upsert only moves last_seen_at forward, so a value that was once too
+    late (e.g. from a mis-dated match since corrected) would otherwise never heal, and a
+    rebuild from scratch would disagree with an incrementally built database."""
+    return conn.execute(
+        """
+        UPDATE players p
+        SET handle = x.handle, last_seen_at = x.played_at, updated_at = now()
+        FROM (
+            SELECT DISTINCT ON (pl.player_id) pl.player_id, pl.handle, m.played_at
+            FROM map_players pl
+            JOIN maps mp ON mp.id = pl.map_id
+            JOIN matches m ON m.id = mp.match_id
+            ORDER BY pl.player_id, m.played_at DESC NULLS LAST, m.id DESC
+        ) x
+        WHERE p.id = x.player_id
+          AND (p.handle, p.last_seen_at) IS DISTINCT FROM (x.handle, x.played_at)
+        """
+    ).rowcount
+
+
 def reparse(conn: Connection) -> Run:
     run = Run(conn, "reparse")
     try:
@@ -61,13 +85,19 @@ def reparse(conn: Connection) -> Run:
             with conn.transaction():
                 run.events_checked += parse_events(conn, row["body"])
 
+        # Showmatches (dropped from the match lists) and hand-excluded matches are skipped
+        skip = {
+            int(r["match_id"])
+            for r in conn.execute("SELECT match_id FROM match_exclusions").fetchall()
+        }
         for row in latest_responses(conn, "/v2/events/matches"):
             event_id = to_int(row["params"].get("event_id"))
             if event_id is None:
                 continue
             with conn.transaction():
                 _ensure_event(conn, event_id)
-                parse_event_matches(conn, event_id, row["body"])
+                listed = parse_event_matches(conn, event_id, row["body"])
+            skip.update(m.match_id for m in listed if m.showmatch)
 
         for row in all_responses(conn, "/v2/event/{event_id}"):
             event_id = to_int(row["params"].get("event_id"))
@@ -85,7 +115,7 @@ def reparse(conn: Connection) -> Run:
 
         for row in latest_responses(conn, "/v2/match/details"):
             match_id = to_int(row["params"].get("match_id"))
-            if match_id is None:
+            if match_id is None or match_id in skip:
                 continue
             try:
                 with conn.transaction():
@@ -98,6 +128,9 @@ def reparse(conn: Connection) -> Run:
                 continue
             run.matches_fetched += 1
             run.warn(match_id, issues)
+
+        with conn.transaction():
+            refresh_players(conn)
     except Exception as exc:
         run.finish(exc)
         raise

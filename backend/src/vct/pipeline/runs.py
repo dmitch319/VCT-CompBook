@@ -17,6 +17,7 @@ class Run:
     events_checked: int = 0
     matches_fetched: int = 0
     matches_failed: int = 0
+    showmatches_skipped: int = 0  # completed showmatches seen in match lists, not stored
     errors: dict[str, str] = field(default_factory=dict)
     warnings: dict[str, list[str]] = field(default_factory=dict)
 
@@ -45,7 +46,11 @@ class Run:
             status = "failed"
         else:
             status = "success"
-        details: dict[str, Any] = {"match_errors": self.errors, "warnings": self.warnings}
+        details: dict[str, Any] = {
+            "match_errors": self.errors,
+            "warnings": self.warnings,
+            "showmatches_skipped": self.showmatches_skipped,
+        }
         self.conn.execute(
             """
             UPDATE sync_runs SET

@@ -9,6 +9,7 @@ from typing import Any
 
 import fixtures as fx
 import httpx
+import pytest
 from alembic import command
 from alembic.config import Config
 
@@ -366,3 +367,180 @@ def test_429_waits_and_retries(db: Connection, monkeypatch: Any) -> None:
     assert sleeps == [7.0 + 1.0]  # Retry-After plus a second of slack
     codes = db.execute("SELECT status_code FROM raw_responses ORDER BY id").fetchall()
     assert [c["status_code"] for c in codes] == [429, 200]  # both stored
+
+
+def test_status_reports_coverage_backlog_and_duplicates(db: Connection) -> None:
+    from vct.pipeline.status import collect_status, incomplete_comps
+
+    run_full_sync(db, FakeVlrggapi())
+    s = collect_status(db)
+    assert s["events_tracked"] == 1
+    assert (s["matches_completed"], s["matches_parsed"], s["matches_pending"]) == (1, 1, 0)
+    assert (s["maps"], s["team_maps"], s["team_maps_full_comp"]) == (2, 4, 4)
+    assert s["comp_coverage_pct"] == 100.0
+    assert (s["players"], s["duplicate_handles"], s["duplicate_handles_same_team"]) == (10, 0, 0)
+    assert s["last_sync"]["status"] == "success"
+
+    # Break two of the four team-maps: one short a player, one with an unknown agent
+    db.execute("UPDATE map_players SET agent = 'Mysteryagent' WHERE handle = 'alp_1'")
+    db.execute(
+        "DELETE FROM map_players WHERE handle = 'alp_1' AND map_id = (SELECT min(id) FROM maps)"
+    )
+    from vct.pipeline.parse import refresh_comps
+
+    refresh_comps(db)
+    s = collect_status(db)
+    # Map 1: Alpha has 4 players (incomplete); map 2: Alpha has an unknown agent
+    assert s["team_maps_full_comp"] == 2 and s["comp_coverage_pct"] == 50.0
+    assert len(incomplete_comps(db)) == 2
+
+    # The same handle under two IDs on one team is flagged
+    db.execute("INSERT INTO players (id, handle) VALUES (999, 'alp_2')")
+    db.execute(
+        "INSERT INTO map_players (map_id, player_id, team_id, handle, agent)"
+        " SELECT id, 999, %s, 'ALP_2', 'Jett' FROM maps WHERE map_order = 1",
+        (fx.ALPHA,),
+    )
+    s = collect_status(db)
+    assert (s["duplicate_handles"], s["duplicate_handles_same_team"]) == (1, 1)
+
+
+def test_agent_names_are_matched_to_the_seed_spelling(db: Connection) -> None:
+    # Older vlr.gg pages print "Kayo" where seed/agent_roles.csv says "KAY/O"
+    detail = copy.deepcopy(fx.match_detail_body())
+    lotus_bravo = detail["data"]["segments"][0]["maps"][1]["players"]["team2"]
+    assert lotus_bravo[1]["agent"] == "KAY/O"
+    lotus_bravo[1]["agent"] = "Kayo"
+    lotus_bravo[0]["agent"] = " neon "
+
+    run_full_sync(db, FakeVlrggapi(detail))
+
+    row = db.execute(
+        "SELECT comp_key, archetype FROM team_map_comps WHERE map_name = 'Lotus' AND team_id = %s",
+        (fx.BRAVO,),
+    ).fetchone()
+    assert row == {"comp_key": "Chamber,Harbor,KAY/O,Neon,Viper", "archetype": "1D-1I-2C-1S"}
+    run = db.execute("SELECT details FROM sync_runs WHERE command = 'sync'").fetchone()
+    assert run is not None and run["details"]["warnings"] == {}
+
+
+def test_showmatches_never_reach_the_database(alembic_config: Config, db: Connection) -> None:
+    from psycopg import errors
+
+    from vct.pipeline.status import collect_status
+
+    api = FakeVlrggapi()
+    api.event_matches = fx.event_matches_body(extra_completed=((1004, "2026-03-11 18:00:00"),))
+    show = api.event_matches["data"]["segments"][-1]
+    show["stage"], show["event_series"] = "Showmatch", "All-Star Match"
+    api.details["1004"] = fx.renamed_detail_body(1004, "alp_1", "a_streamer")
+    run_full_sync(db, api)
+
+    assert api.calls["/v2/match/details"] == 1  # only the real match was fetched
+    assert db.execute("SELECT count(*) AS n FROM matches WHERE id = 1004").fetchone() == {"n": 0}
+    s = collect_status(db)
+    assert (s["matches_completed"], s["matches_pending"], s["showmatches_skipped"]) == (1, 0, 1)
+    assert db.execute("SELECT status FROM sync_runs WHERE command = 'sync'").fetchone() == {
+        "status": "success"
+    }
+
+    # A rebuild skips it too, even if its detail had been stored
+    db.execute(
+        "INSERT INTO raw_responses (endpoint, params, status_code, body)"
+        " VALUES ('/v2/match/details', '{\"match_id\": \"1004\"}', 200, %s)",
+        (json.dumps(api.details["1004"]),),
+    )
+    run = reparse(db)
+    assert (run.matches_fetched, run.matches_failed) == (1, 0)
+    assert db.execute("SELECT count(*) AS n FROM matches WHERE id = 1004").fetchone() == {"n": 0}
+
+    # The database itself refuses a showmatch row
+    with pytest.raises(errors.CheckViolation):
+        db.execute(
+            "INSERT INTO matches (id, event_id, stage) VALUES (1005, %s, 'Showmatch')",
+            (fx.EVENT_ID,),
+        )
+
+    # Migration 0003 removes showmatches stored before it
+    command.downgrade(alembic_config, "0002")
+    db.execute(
+        "INSERT INTO matches (id, event_id, stage, series) VALUES (1006, %s, 'Main', 'Showmatch')",
+        (fx.EVENT_ID,),
+    )
+    command.upgrade(alembic_config, "head")
+    assert db.execute("SELECT count(*) AS n FROM matches WHERE id = 1006").fetchone() == {"n": 0}
+
+
+def test_reparse_heals_a_last_seen_at_that_was_too_late(db: Connection) -> None:
+    run_full_sync(db, FakeVlrggapi())
+    # As if the match had once been stored with a wrong, later time
+    db.execute("UPDATE players SET last_seen_at = '2030-01-01' WHERE id = 101")
+
+    reparse(db)
+
+    row = db.execute("SELECT handle, last_seen_at FROM players WHERE id = 101").fetchone()
+    assert row == {"handle": "alp_1", "last_seen_at": datetime(2026, 3, 10, 18, tzinfo=UTC)}
+
+
+def test_exact_case_settles_two_players_with_the_same_handle(db: Connection) -> None:
+    # Bravo's transfer log has "Brv_5" (another person) and the stand-in "brv_5"
+    api = FakeVlrggapi()
+    roster = fx.team_roster_body(fx.BRAVO)
+    roster["data"]["segments"][0]["transactions"].append(
+        {"date": "2020-01-01", "action": "leave", "player": {"name": "Brv_5", "id": "777"}}
+    )
+    api.team_rosters[fx.BRAVO] = roster
+    run_full_sync(db, api)
+
+    row = db.execute(
+        "SELECT DISTINCT player_id FROM map_players WHERE handle = %s", (fx.STANDIN,)
+    ).fetchone()
+    assert row == {"player_id": fx.PLAYER_IDS[fx.STANDIN]}
+
+
+def test_player_override_resolves_a_standin_no_roster_has(db: Connection, tmp_path: Any) -> None:
+    from vct.pipeline.seed import load_player_overrides
+
+    api = FakeVlrggapi()
+    api.team_rosters[fx.BRAVO] = fx.team_roster_body(fx.BRAVO, include_standin=False)
+    overrides = tmp_path / "player_overrides.csv"
+    overrides.write_text(
+        f"team_id,handle,player_id,note\n{fx.BRAVO},{fx.STANDIN},{fx.PLAYER_IDS[fx.STANDIN]},"
+        '"one-event stand-in"\n',
+        encoding="utf-8",
+    )
+    assert load_player_overrides(db, overrides) == 1
+    run_full_sync(db, api)
+
+    run = db.execute("SELECT status FROM sync_runs WHERE command = 'sync'").fetchone()
+    assert run == {"status": "success"}
+    assert api.calls[f"/v2/team/{fx.BRAVO}/roster"] == 0  # override found it first
+    row = db.execute(
+        "SELECT DISTINCT player_id FROM map_players WHERE handle = %s", (fx.STANDIN,)
+    ).fetchone()
+    assert row == {"player_id": fx.PLAYER_IDS[fx.STANDIN]}
+
+
+def test_excluded_match_is_not_fetched_and_drops_out(db: Connection, tmp_path: Any) -> None:
+    from vct.pipeline.seed import load_match_exclusions
+    from vct.pipeline.status import collect_status
+
+    api = FakeVlrggapi()
+    run_full_sync(db, api)
+    exclusions = tmp_path / "match_exclusions.csv"
+    exclusions.write_text(
+        f'match_id,reason\n{fx.MATCH_ID},"full stand-in roster"\n', encoding="utf-8"
+    )
+    assert load_match_exclusions(db, exclusions) == 1
+
+    # Already-parsed data for it is removed, and sync doesn't fetch it again
+    assert db.execute("SELECT count(*) AS n FROM maps").fetchone() == {"n": 0}
+    with client_for(db, api) as client:
+        sync(db, client)
+    assert api.calls["/v2/match/details"] == 1
+    s = collect_status(db)
+    assert (s["matches_excluded"], s["matches_pending"], s["matches_parsed"]) == (1, 0, 0)
+
+    run = reparse(db)
+    assert (run.matches_fetched, run.matches_failed) == (0, 0)
+    assert db.execute("SELECT count(*) AS n FROM maps").fetchone() == {"n": 0}

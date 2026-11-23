@@ -13,9 +13,9 @@ Response shapes follow vlrggapi at the commit pinned in docker-compose.yml:
 """
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -71,6 +71,65 @@ def parse_utc_timestamp(text: Any) -> datetime | None:
         return datetime.strptime(str(text).strip(), "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
     except ValueError:
         return None
+
+
+def listed_played_at(m: dict[str, Any]) -> datetime | None:
+    """A listed match's unix_timestamp, but only if it falls within a day of the list's
+    own date header ('Sat, February 28, 2026').
+
+    vlrggapi derives unix_timestamp from countdown text and reads a completed match's
+    '8mo' as 8 minutes, so older matches come out stamped with roughly the fetch time.
+    The cross-check throws those away; the match detail supplies the real time anyway.
+    """
+    stamp = parse_utc_timestamp(m.get("unix_timestamp"))
+    header = re.sub(r"^[A-Za-z]+,\s*", "", str(m.get("date") or "").strip())
+    try:
+        day = datetime.strptime(header, "%B %d, %Y").date()
+    except ValueError:
+        return None
+    if stamp is None or abs((stamp.date() - day).days) > 1:
+        return None
+    return stamp
+
+
+# Fixed UTC offsets: vlr.gg prints the abbreviation, which already says whether DST applies
+_TZ_OFFSETS = {
+    "UTC": 0, "GMT": 0, "BST": 1, "CET": 1, "CEST": 2, "EET": 2, "EEST": 3,
+    "EST": -5, "EDT": -4, "CST": -6, "CDT": -5, "MST": -7, "MDT": -6, "PST": -8, "PDT": -7,
+    "BRT": -3, "SGT": 8, "KST": 9, "JST": 9, "AEST": 10, "AEDT": 11,
+}  # fmt: skip
+_DETAIL_DATE_RE = re.compile(
+    r"(?:[A-Za-z]+,\s*)?(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?"
+    r"(?:,\s*(?P<year>\d{4}))?\s+(?P<time>\d{1,2}:\d{2}\s*[AP]M)\s+(?P<tz>[A-Z]{2,5})\b"
+)
+
+
+def parse_detail_datetime(text: Any, reference: datetime | None = None) -> datetime | None:
+    """The match time from a match detail's header, which names its time zone:
+    'February 28, 2026 12:00 PM EST Patch 12.03', or for the current year
+    'Sunday, November 15 1:30 PM EST Patch 13.10'. Without a year, the year is the one
+    that puts the match on or before `reference` (when the page was fetched)."""
+    m = _DETAIL_DATE_RE.search(str(text or ""))
+    if not m or m["tz"] not in _TZ_OFFSETS:
+        return None
+    tz = timezone(timedelta(hours=_TZ_OFFSETS[m["tz"]]))
+    if m["year"]:
+        years = [int(m["year"])]
+    elif reference is not None:
+        years = [reference.year, reference.year - 1]
+    else:
+        return None
+    for year in years:
+        try:
+            naive = datetime.strptime(
+                f"{m['month']} {m['day']} {year} {m['time'].replace(' ', '')}", "%B %d %Y %I:%M%p"
+            )
+        except ValueError:
+            return None
+        when = naive.replace(tzinfo=tz)
+        if m["year"] or reference is None or when <= reference + timedelta(days=2):
+            return when.astimezone(UTC)
+    return None
 
 
 _PATCH_RE = re.compile(r"\bPatch\s*(\d+(?:\.\d+)+)", re.IGNORECASE)
@@ -134,6 +193,24 @@ def segments(body: Any) -> list[dict[str, Any]]:
     return [s for s in segs if isinstance(s, dict)] if isinstance(segs, list) else []
 
 
+def _agent_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.casefold())
+
+
+def agent_canonicalizer(conn: Connection) -> Callable[[str], str]:
+    """Map an agent name as vlr.gg prints it onto the spelling in the agents table,
+    ignoring case and punctuation: older pages say 'Kayo' where the seed says 'KAY/O'.
+    Unknown names pass through unchanged (validation reports them)."""
+    rows = conn.execute("SELECT name FROM agents").fetchall()
+    by_key = {_agent_key(r["name"]): r["name"] for r in rows}
+
+    def canonical(name: str) -> str:
+        name = name.strip()
+        return by_key.get(_agent_key(name), name) if name else name
+
+    return canonical
+
+
 class ParseError(ValueError):
     pass
 
@@ -178,21 +255,39 @@ def parse_events(conn: Connection, body: Any) -> int:
 # ------------------------------------------------------------------ /v2/events/matches
 
 
+# Must match the matches_not_showmatch CHECK constraint (migration 0003)
+SHOWMATCH_PATTERN = re.compile(r"show\s*match|all[- ]star", re.IGNORECASE)
+
+
+def is_showmatch(stage: str | None, series: str | None) -> bool:
+    """Showmatches and all-star games: vlr.gg lists them with stage 'Showmatch'."""
+    return any(SHOWMATCH_PATTERN.search(text or "") for text in (stage, series))
+
+
 @dataclass(frozen=True)
 class ListedMatch:
     match_id: int
     completed: bool
+    showmatch: bool = False  # listed, but not stored
 
 
 def parse_event_matches(conn: Connection, event_id: int, body: Any) -> list[ListedMatch]:
     """Upsert a stub row per listed match (event, stage, time, status). Team IDs and
-    scores come later from the match detail. Returns the listed matches."""
+    scores come later from the match detail. Showmatches are not stored (a row left
+    from before a relabel is deleted). Returns every listed match."""
     listed: list[ListedMatch] = []
     for m in segments(body):
         match_id = to_int(m.get("match_id"))
         if match_id is None:
             continue
         status = (m.get("status") or "").strip() or None
+        completed = (status or "").lower() == "completed"
+        stage = (m.get("stage") or "").strip() or None
+        series = (m.get("event_series") or "").strip() or None
+        if is_showmatch(stage, series):
+            conn.execute("DELETE FROM matches WHERE id = %s", (match_id,))
+            listed.append(ListedMatch(match_id, completed, showmatch=True))
+            continue
         conn.execute(
             """
             INSERT INTO matches (id, event_id, stage, series, played_at, status)
@@ -201,20 +296,16 @@ def parse_event_matches(conn: Connection, event_id: int, body: Any) -> list[List
                 event_id   = EXCLUDED.event_id,
                 stage      = COALESCE(EXCLUDED.stage, matches.stage),
                 series     = COALESCE(EXCLUDED.series, matches.series),
-                played_at  = COALESCE(EXCLUDED.played_at, matches.played_at),
+                -- Until the detail is parsed the list's time (or NULL) stands; after,
+                -- the detail's time-zone-qualified time does
+                played_at  = CASE WHEN matches.parsed_at IS NULL
+                                  THEN EXCLUDED.played_at ELSE matches.played_at END,
                 status     = COALESCE(EXCLUDED.status, matches.status),
                 updated_at = now()
             """,
-            (
-                match_id,
-                event_id,
-                (m.get("stage") or "").strip() or None,
-                (m.get("event_series") or "").strip() or None,
-                parse_utc_timestamp(m.get("unix_timestamp")),
-                status,
-            ),
+            (match_id, event_id, stage, series, listed_played_at(m), status),
         )
-        listed.append(ListedMatch(match_id, (status or "").lower() == "completed"))
+        listed.append(ListedMatch(match_id, completed))
     return listed
 
 
@@ -321,6 +412,7 @@ def parse_match_detail(
             (team_id, name, teams[-1].tag or None),
         )
     t1, t2 = teams
+    canonical_agent = agent_canonicalizer(conn)
 
     def team_for(label: str | None) -> int | None:
         if not label:
@@ -334,11 +426,22 @@ def parse_match_detail(
     veto_text = (seg.get("map_vetos") or "").strip() or None
     patch = find_patch(seg.get("date"), veto_text)
 
+    # The detail header names its time zone, so it beats the list's time. A header
+    # without a year is dated relative to when the response was fetched.
+    fetched_at: datetime | None = None
+    if raw_id is not None:
+        raw = conn.execute(
+            "SELECT fetched_at FROM raw_responses WHERE id = %s", (raw_id,)
+        ).fetchone()
+        fetched_at = raw["fetched_at"] if raw else None
+    detail_time = parse_detail_datetime(seg.get("date"), fetched_at)
+
     match_row = conn.execute(
         """
         UPDATE matches SET
             team1_id = %s, team2_id = %s, team1_score = %s, team2_score = %s,
             winner_team_id = %s, best_of = %s, patch = %s, veto_text = %s,
+            played_at = COALESCE(%s, played_at),
             detail_raw_id = COALESCE(%s, detail_raw_id), parsed_at = now(), updated_at = now()
         WHERE id = %s
         RETURNING played_at
@@ -352,6 +455,7 @@ def parse_match_detail(
             best_of_from_score(score1, score2),
             patch,
             veto_text,
+            detail_time,
             raw_id,
             match_id,
         ),
@@ -477,7 +581,7 @@ def parse_match_detail(
                         player_id,
                         team.id,
                         handle,
-                        (p.get("agent") or "").strip(),
+                        canonical_agent(p.get("agent") or ""),
                         to_decimal(p.get("rating")),
                         to_int(p.get("acs")),
                         to_int(p.get("kills")),

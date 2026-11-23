@@ -61,15 +61,21 @@ def sync(
                 listed = parse_event_matches(conn, event_id, resp.body)
             run.events_checked += 1
 
-            completed = [m.match_id for m in listed if m.completed]
-            have = {
+            # Showmatches aren't stored at all (see migration 0003)
+            run.showmatches_skipped += sum(1 for m in listed if m.completed and m.showmatch)
+            completed = [m.match_id for m in listed if m.completed and not m.showmatch]
+            # Already parsed, or excluded by hand (seed/match_exclusions.csv)
+            skip = {
                 int(r["id"])
                 for r in conn.execute(
-                    "SELECT id FROM matches WHERE id = ANY(%s) AND parsed_at IS NOT NULL",
-                    (completed,),
+                    """
+                    SELECT id FROM matches WHERE id = ANY(%(ids)s) AND parsed_at IS NOT NULL
+                    UNION SELECT match_id FROM match_exclusions WHERE match_id = ANY(%(ids)s)
+                    """,
+                    {"ids": completed},
                 ).fetchall()
             }
-            todo = [mid for mid in completed if mid not in have]
+            todo = [mid for mid in completed if mid not in skip]
             log.info("event %d: %d completed, %d new", event_id, len(completed), len(todo))
             if not todo or at_limit():
                 continue

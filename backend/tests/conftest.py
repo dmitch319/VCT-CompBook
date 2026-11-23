@@ -41,11 +41,11 @@ def alembic_config() -> Config:
 
 @pytest.fixture
 def db(alembic_config: Config) -> Iterator[Connection]:
-    """A freshly migrated, empty database with agents seeded."""
-    from vct.pipeline.seed import load_agents
+    """A freshly migrated, empty database with seed/ loaded."""
+    from vct.pipeline.seed import load_seed
 
     command.downgrade(alembic_config, "base")
     command.upgrade(alembic_config, "head")
     with connect(TEST_DATABASE_URL, autocommit=True) as conn:
-        load_agents(conn)
+        load_seed(conn)
         yield conn

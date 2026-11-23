@@ -85,3 +85,40 @@ def test_parse_veto_text() -> None:
 )
 def test_is_tier1_event(name: str, tier1: bool) -> None:
     assert is_tier1_event(name) is tier1
+
+
+def test_parse_detail_datetime() -> None:
+    from vct.pipeline.parse import parse_detail_datetime
+
+    # With a year (older matches), EST is UTC-5
+    assert parse_detail_datetime("February 28, 2026 12:00 PM EST Patch 12.03") == datetime(
+        2026, 2, 28, 17, tzinfo=UTC
+    )
+    # Without a year (current-year matches): the year that isn't in the future
+    fetched = datetime(2026, 11, 22, 12, tzinfo=UTC)
+    assert parse_detail_datetime(
+        "Sunday, November 15 1:30 PM EST Patch 13.10", fetched
+    ) == datetime(2026, 11, 15, 18, 30, tzinfo=UTC)
+    # Fetched in early January, a December date belongs to the previous year
+    january = datetime(2027, 1, 3, tzinfo=UTC)
+    assert parse_detail_datetime("Saturday, December 20 9:00 AM PST", january) == datetime(
+        2026, 12, 20, 17, tzinfo=UTC
+    )
+    assert parse_detail_datetime("Tuesday, March 10th 6:00 PM PDT", fetched) == datetime(
+        2026, 3, 11, 1, tzinfo=UTC
+    )
+    assert parse_detail_datetime("Sunday, November 15 1:30 PM EST") is None  # no year, no ref
+    assert parse_detail_datetime("February 28, 2026 12:00 PM XYZ") is None  # unknown zone
+    assert parse_detail_datetime("") is None
+
+
+def test_listed_played_at_rejects_vlrggapis_bad_timestamps() -> None:
+    from vct.pipeline.parse import listed_played_at
+
+    good = {"date": "Tue, March 10, 2026", "unix_timestamp": "2026-03-10 18:00:00"}
+    assert listed_played_at(good) == datetime(2026, 3, 10, 18, tzinfo=UTC)
+    # Seen live: a Feb 2026 match stamped with the fetch date
+    bad = {"date": "Sat, February 28, 2026", "unix_timestamp": "2026-11-22 21:15:00"}
+    assert listed_played_at(bad) is None
+    assert listed_played_at({"date": "Today", "unix_timestamp": "2026-11-22 21:15:00"}) is None
+    assert listed_played_at({"date": "Tue, March 10, 2026", "unix_timestamp": ""}) is None
