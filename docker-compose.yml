@@ -1,0 +1,52 @@
+# Local development stack: Postgres + self-hosted vlrggapi.
+#
+#   cp .env.example .env      # then fill in the values
+#   docker compose up -d
+#
+# Postgres:  localhost:${POSTGRES_PORT:-5432}
+# vlrggapi:  http://localhost:${VLRGGAPI_PORT:-3001}  (docs at /, health at /v2/health)
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  vlrggapi:
+    # Unofficial vlr.gg API (https://github.com/axsddlr/vlrggapi, MIT). The public
+    # instance is down, so we build and run it ourselves. Built from a pinned commit
+    # so every machine (and CI) runs the same parser; bump the ref deliberately.
+    build:
+      context: https://github.com/axsddlr/vlrggapi.git#4e87238fb5f6949550db5ee9f98e919549fc09d0
+    image: vct-compbook/vlrggapi:4e87238
+    restart: unless-stopped
+    ports:
+      - "${VLRGGAPI_PORT:-3001}:3001"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, json; r = urllib.request.urlopen('http://127.0.0.1:3001/v2/health', timeout=3); assert json.loads(r.read())['status'] == 'success'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  pgdata:
