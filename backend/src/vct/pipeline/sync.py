@@ -9,6 +9,12 @@ are fetched to resolve handles (see rosters.py): the event roster once per event
 new matches, and a team's roster history only when a handle isn't on the event roster,
 at most once per team per run. A match with a player that still can't be resolved is not
 stored; it is recorded as failed and retried by the next sync.
+
+Two modes share this code:
+  backfill (default)  every tracked event, or the ones given
+  incremental         refresh the event lists (one upcoming page, one completed page),
+                      then only the tracked events that can still have new matches; see
+                      incremental_event_ids. Meant to run on a schedule.
 """
 
 import logging
@@ -16,6 +22,7 @@ from dataclasses import dataclass, field
 
 from vct.db import Connection
 from vct.pipeline.client import VlrClient
+from vct.pipeline.discover import refresh_events
 from vct.pipeline.parse import parse_event_matches, parse_match_detail
 from vct.pipeline.rosters import (
     parse_event_roster,
@@ -40,25 +47,67 @@ def tracked_event_ids(conn: Connection) -> list[int]:
     return [int(r["id"]) for r in rows]
 
 
+def incremental_event_ids(conn: Connection) -> list[int]:
+    """Tracked events that can still have completed matches we haven't stored:
+      - ongoing, or of unknown status (tracked by hand before discover saw it)
+      - completed, but not listed since it was seen to complete: its last matches may
+        have finished after the previous sync (migration 0005)
+      - with a match listed as completed that isn't parsed or excluded yet: a failure,
+        or cut off by --limit, retried like a backfill would
+    Upcoming events have no completed matches yet and are skipped."""
+    rows = conn.execute(
+        """
+        SELECT e.id FROM events e
+        WHERE e.tracked AND (
+            e.status IS NULL OR e.status = 'ongoing'
+            OR (e.status = 'completed'
+                AND e.completed_at > COALESCE(e.matches_listed_at, '-infinity'))
+            OR EXISTS (
+                SELECT 1 FROM matches m
+                WHERE m.event_id = e.id AND m.parsed_at IS NULL
+                  AND lower(m.status) = 'completed'
+                  AND NOT EXISTS (SELECT 1 FROM match_exclusions x WHERE x.match_id = m.id)
+            )
+        )
+        ORDER BY e.id
+        """
+    ).fetchall()
+    return [int(r["id"]) for r in rows]
+
+
 def sync(
     conn: Connection,
     client: VlrClient,
     event_ids: list[int] | None = None,
     limit: int | None = None,
+    incremental: bool = False,
 ) -> Run:
-    """Sync the given events (default: all tracked). `limit` caps match-detail fetches
-    for this run, which is handy for a first test against a live vlrggapi."""
-    run = Run(conn, "sync")
+    """Sync the given events (default: all tracked; with `incremental`, see
+    incremental_event_ids). `limit` caps match-detail fetches for this run, which is
+    handy for a first test against a live vlrggapi."""
+    if incremental and event_ids is not None:
+        raise ValueError("incremental picks its own events; don't pass event_ids")
+    run = Run(conn, "sync", mode="incremental" if incremental else "backfill")
     state = SyncState(run)
 
     def at_limit() -> bool:
         return limit is not None and run.matches_fetched + run.matches_failed >= limit
 
     try:
-        for event_id in event_ids if event_ids is not None else tracked_event_ids(conn):
+        if incremental:
+            # Picks up events that started, and flips finished ones to completed
+            refresh_events(conn, client, completed_pages=1)
+            event_ids = incremental_event_ids(conn)
+            log.info("incremental: %d events to check", len(event_ids))
+        elif event_ids is None:
+            event_ids = tracked_event_ids(conn)
+        for event_id in event_ids:
             resp = client.get("/v2/events/matches", event_id=event_id)
             with conn.transaction():
                 listed = parse_event_matches(conn, event_id, resp.body)
+                conn.execute(
+                    "UPDATE events SET matches_listed_at = now() WHERE id = %s", (event_id,)
+                )
             run.events_checked += 1
 
             # Showmatches aren't stored at all (see migration 0003)

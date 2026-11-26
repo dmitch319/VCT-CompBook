@@ -15,19 +15,26 @@ def discover(conn: Connection, client: VlrClient, completed_pages: int = 3) -> R
     Use a larger `completed_pages` once for a backfill of past seasons."""
     run = Run(conn, "discover")
     try:
-        requests: list[dict[str, str | int]] = [{"q": "upcoming"}]
-        requests += [{"q": "completed", "page": p} for p in range(1, completed_pages + 1)]
-        for params in requests:
-            resp = client.get("/v2/events", **params)
-            with conn.transaction():
-                n = parse_events(conn, resp.body)
-            run.events_checked += n
-            log.info("events %s: %d listed", params, n)
+        run.events_checked += refresh_events(conn, client, completed_pages)
     except Exception as exc:
         run.finish(exc)
         raise
     run.finish()
     return run
+
+
+def refresh_events(conn: Connection, client: VlrClient, completed_pages: int) -> int:
+    """Fetch and upsert the event lists. Returns how many events were listed."""
+    requests: list[dict[str, str | int]] = [{"q": "upcoming"}]
+    requests += [{"q": "completed", "page": p} for p in range(1, completed_pages + 1)]
+    total = 0
+    for params in requests:
+        resp = client.get("/v2/events", **params)
+        with conn.transaction():
+            n = parse_events(conn, resp.body)
+        total += n
+        log.info("events %s: %d listed", params, n)
+    return total
 
 
 def set_tracked(conn: Connection, event_id: int, tracked: bool = True) -> None:

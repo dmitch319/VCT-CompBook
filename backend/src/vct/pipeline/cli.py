@@ -4,8 +4,9 @@
   vct-pipeline seed                     load seed/ (agents, player overrides, exclusions)
   vct-pipeline discover [--pages N]     find VCT events, mark tier-1 ones tracked
   vct-pipeline track EVENT_ID [--off]   track (or untrack) an event by hand
-  vct-pipeline sync [--event ID] [--limit N]
+  vct-pipeline sync [--event ID | --incremental] [--limit N]
                                         fetch new completed matches for tracked events
+                                        (--incremental: only events still in play)
   vct-pipeline reparse                  rebuild tables from raw_responses (no fetching)
   vct-pipeline status [--json] [--incomplete N]
                                         coverage, backlog and duplicate checks
@@ -30,8 +31,9 @@ from vct.pipeline.sync import sync
 
 
 def _report(run: Run) -> int:
+    label = f"{run.command} {run.mode}" if run.mode else run.command
     print(
-        f"run {run.id} ({run.command}): {run.events_checked} events, "
+        f"run {run.id} ({label}): {run.events_checked} events, "
         f"{run.matches_fetched} matches parsed, {run.matches_failed} failed, "
         f"{len(run.warnings)} with warnings"
     )
@@ -70,7 +72,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("event_id", type=int)
     p.add_argument("--off", action="store_true", help="stop tracking")
     p = sub.add_parser("sync", help="fetch new completed matches for tracked events")
-    p.add_argument("--event", type=int, action="append", help="only this event (repeatable)")
+    which = p.add_mutually_exclusive_group()
+    which.add_argument("--event", type=int, action="append", help="only this event (repeatable)")
+    which.add_argument(
+        "--incremental",
+        action="store_true",
+        help="refresh event lists, then only ongoing (or just-finished) tracked events",
+    )
     p.add_argument("--limit", type=int, help="fetch at most N match details")
     sub.add_parser("reparse", help="rebuild normalized tables from raw_responses")
     p = sub.add_parser("status", help="coverage, backlog and duplicate checks")
@@ -116,7 +124,14 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "discover":
                 return _report(discover(conn, client, completed_pages=args.pages))
             if args.command == "sync":
-                return _report(sync(conn, client, event_ids=args.event, limit=args.limit))
+                run = sync(
+                    conn,
+                    client,
+                    event_ids=args.event,
+                    limit=args.limit,
+                    incremental=args.incremental,
+                )
+                return _report(run)
     return 2
 
 

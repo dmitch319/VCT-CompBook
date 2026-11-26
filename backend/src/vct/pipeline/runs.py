@@ -13,6 +13,7 @@ from vct.db import Connection
 class Run:
     conn: Connection
     command: str
+    mode: str | None = None  # e.g. 'incremental'; stored in details
     id: int = 0
     events_checked: int = 0
     matches_fetched: int = 0
@@ -51,6 +52,8 @@ class Run:
             "warnings": self.warnings,
             "showmatches_skipped": self.showmatches_skipped,
         }
+        if self.mode is not None:
+            details["mode"] = self.mode
         self.conn.execute(
             """
             UPDATE sync_runs SET

@@ -235,6 +235,11 @@ def parse_events(conn: Connection, body: Any) -> int:
                 name        = EXCLUDED.name,
                 region      = COALESCE(EXCLUDED.region, events.region),
                 status      = COALESCE(EXCLUDED.status, events.status),
+                -- Stamped when an event we already knew turns completed (migration 0005)
+                completed_at = CASE
+                    WHEN EXCLUDED.status = 'completed'
+                         AND events.status IS DISTINCT FROM 'completed' THEN now()
+                    ELSE events.completed_at END,
                 dates_label = COALESCE(EXCLUDED.dates_label, events.dates_label),
                 tracked     = events.tracked OR EXCLUDED.tracked,
                 updated_at  = now()

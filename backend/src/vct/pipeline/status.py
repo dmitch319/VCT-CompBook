@@ -101,6 +101,7 @@ def collect_status(conn: Connection) -> dict[str, Any]:
         else {
             "run": last["id"],
             "status": last["status"],
+            "mode": last["details"].get("mode", "backfill"),
             "finished_at": last["finished_at"].isoformat() if last["finished_at"] else None,
             "matches_fetched": last["matches_fetched"],
             "matches_failed": last["matches_failed"],

@@ -26,6 +26,8 @@ class FakeVlrggapi:
 
     def __init__(self, detail: dict[str, Any] | None = None) -> None:
         self.calls: Counter[str] = Counter()
+        self.matches_listed: Counter[int] = Counter()  # /v2/events/matches per event ID
+        self.events = fx.events_body()
         self.details: dict[str, dict[str, Any]] = {
             str(fx.MATCH_ID): detail or fx.match_detail_body()
         }
@@ -38,8 +40,9 @@ class FakeVlrggapi:
         self.calls[path] += 1
         body: dict[str, Any] | None = None
         if path == "/v2/events":
-            body = fx.events_body()
+            body = self.events
         elif path == "/v2/events/matches":
+            self.matches_listed[int(request.url.params["event_id"])] += 1
             body = self.event_matches
         elif path == "/v2/match/details":
             body = self.details.get(request.url.params["match_id"])
@@ -78,7 +81,7 @@ def snapshot(conn: Connection) -> dict[str, Any]:
         "rounds": "map_id, round_number",
         "veto_steps": "match_id, step_order",
     }
-    volatile = {"updated_at", "parsed_at", "detail_raw_id"}
+    volatile = {"updated_at", "parsed_at", "detail_raw_id", "matches_listed_at", "completed_at"}
     out = {}
     for table, order in tables.items():
         rows = conn.execute(f"SELECT * FROM {table} ORDER BY {order}").fetchall()
@@ -544,3 +547,95 @@ def test_excluded_match_is_not_fetched_and_drops_out(db: Connection, tmp_path: A
     run = reparse(db)
     assert (run.matches_fetched, run.matches_failed) == (0, 0)
     assert db.execute("SELECT count(*) AS n FROM maps").fetchone() == {"n": 0}
+
+
+def add_grand_final(api: FakeVlrggapi, match_id: int = 1003) -> None:
+    """Another completed match in event 2001, with its detail."""
+    api.event_matches = fx.event_matches_body(extra_completed=((match_id, "2026-03-12 18:00:00"),))
+    api.details[str(match_id)] = fx.renamed_detail_body(match_id, "alp_1", "alp_1")
+
+
+def incremental(conn: Connection, api: FakeVlrggapi) -> dict[str, Any]:
+    """Run an incremental sync; returns its sync_runs row."""
+    with client_for(conn, api) as client:
+        run = sync(conn, client, incremental=True)
+    row = conn.execute("SELECT * FROM sync_runs WHERE id = %s", (run.id,)).fetchone()
+    assert row is not None
+    return row
+
+
+def test_incremental_lists_only_tracked_events_still_in_play(db: Connection) -> None:
+    api = FakeVlrggapi()
+    run_full_sync(db, api)
+    # Tracked, but nothing to gain: not started yet, or backfilled long ago
+    db.execute(
+        "INSERT INTO events (id, name, status, tracked) VALUES"
+        " (3001, 'upcoming event', 'upcoming', true),"
+        " (3002, 'past event', 'completed', true)"
+    )
+    add_grand_final(api)
+    api.matches_listed.clear()
+    api.calls.clear()
+
+    run = incremental(db, api)
+    assert api.matches_listed == {fx.EVENT_ID: 1}  # 2002 is untracked
+    assert api.calls["/v2/events"] == 2  # upcoming + first completed page
+    assert api.calls["/v2/match/details"] == 1  # only the new match
+    assert run["status"] == "success" and run["details"]["mode"] == "incremental"
+    assert (run["events_checked"], run["matches_fetched"], run["matches_failed"]) == (1, 1, 0)
+    parsed = db.execute("SELECT id FROM matches WHERE parsed_at IS NOT NULL ORDER BY id")
+    assert [r["id"] for r in parsed.fetchall()] == [fx.MATCH_ID, 1003]
+
+    # Nothing new: one list request for the ongoing event, no details
+    before = snapshot(db)
+    incremental(db, api)
+    assert api.matches_listed == {fx.EVENT_ID: 2}
+    assert api.calls["/v2/match/details"] == 1
+    assert snapshot(db) == before
+
+
+def test_incremental_gives_a_finished_event_one_last_check(db: Connection) -> None:
+    from vct.pipeline.status import collect_status
+
+    api = FakeVlrggapi()
+    run_full_sync(db, api)
+
+    # The grand final is played and vlr.gg marks the event completed; a discover sees
+    # that before the next incremental sync does
+    api.events["data"]["segments"][0]["status"] = "completed"
+    add_grand_final(api)
+    del api.details["1003"]  # and its detail fails the first time
+    with client_for(db, api) as client:
+        discover(db, client, completed_pages=1)
+    event = db.execute("SELECT status, completed_at FROM events WHERE id = %s", (fx.EVENT_ID,))
+    row = event.fetchone()
+    assert row is not None and row["status"] == "completed" and row["completed_at"] is not None
+    api.matches_listed.clear()
+
+    run = incremental(db, api)
+    assert api.matches_listed == {fx.EVENT_ID: 1}
+    assert (run["status"], run["matches_failed"]) == ("failed", 1)
+
+    # The failed match keeps the event in play until it parses
+    add_grand_final(api)
+    run = incremental(db, api)
+    assert api.matches_listed == {fx.EVENT_ID: 2}
+    assert (run["status"], run["matches_fetched"]) == ("success", 1)
+
+    # Then it's done: no more requests for it
+    run = incremental(db, api)
+    assert api.matches_listed == {fx.EVENT_ID: 2}
+    assert run["events_checked"] == 0
+    assert collect_status(db)["last_sync"]["mode"] == "incremental"
+
+
+def test_backfill_and_incremental_record_their_mode(db: Connection) -> None:
+    api = FakeVlrggapi()
+    run_full_sync(db, api)
+    incremental(db, api)
+    modes = db.execute(
+        "SELECT details->>'mode' AS mode FROM sync_runs WHERE command = 'sync' ORDER BY id"
+    ).fetchall()
+    assert [m["mode"] for m in modes] == ["backfill", "incremental"]
+    with client_for(db, api) as client, pytest.raises(ValueError):
+        sync(db, client, event_ids=[fx.EVENT_ID], incremental=True)
